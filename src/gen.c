@@ -1627,6 +1627,7 @@ static int do_help(int argc, char **argv)
 		"       %1$s %2$s skeleton FILE [name OBJECT_NAME]\n"
 		"       %1$s %2$s subskeleton FILE [name OBJECT_NAME]\n"
 		"       %1$s %2$s min_core_btf INPUT OUTPUT OBJECT [OBJECT...]\n"
+		"       %1$s %2$s stip INPUT OUTPUT TYPE_NAME [TYPE_NAME...]\n"
 		"       %1$s %2$s help\n"
 		"\n"
 		"       " HELP_SPEC_OPTIONS " |\n"
@@ -1925,6 +1926,107 @@ static int btfgen_mark_type_match(struct btfgen_info *info, __u32 type_id, bool 
 			return err;
 		break;
 	}
+	case BTF_KIND_FUNC_PROTO: {
+		__u16 vlen = btf_vlen(btf_type);
+		struct btf_param *param;
+
+		/* mark ret type */
+		err = btfgen_mark_type_match(info, btf_type->type, false);
+		if (err)
+			return err;
+
+		/* mark parameters types */
+		param = btf_params(btf_type);
+		for (i = 0; i < vlen; i++) {
+			err = btfgen_mark_type_match(info, param->type, false);
+			if (err)
+				return err;
+			param++;
+		}
+		break;
+	}
+	/* tells if some other type needs to be handled */
+	default:
+		p_err("unsupported kind: %s (%d)", btf_kind_str(btf_type), type_id);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/* Mark types, members, and member types. Compared to btfgen_mark_type_match,
+ * the only difference is that this function supports all defined BTF types.
+ *
+ * The `behind_ptr` argument is used to stop marking of composite types reached
+ * through a pointer. This way, we can keep BTF size in check while providing
+ * reasonable match semantics.
+ */
+static int btfgen_mark_all_type(struct btfgen_info *info, __u32 type_id, bool behind_ptr)
+{
+	const struct btf_type *btf_type;
+	struct btf *btf = info->src_btf;
+	struct btf_type *cloned_type;
+	int i, err;
+
+	if (type_id == 0)
+		return 0;
+
+	btf_type = btf__type_by_id(btf, type_id);
+	/* mark type on cloned BTF as used */
+	cloned_type = (struct btf_type *)btf__type_by_id(info->marked_btf, type_id);
+	cloned_type->name_off = MARKED;
+
+	switch (btf_kind(btf_type)) {
+	case BTF_KIND_UNKN:
+	case BTF_KIND_INT:
+	case BTF_KIND_FLOAT:
+	case BTF_KIND_DATASEC:
+	case BTF_KIND_ENUM:
+	case BTF_KIND_TYPE_TAG:
+	case BTF_KIND_DECL_TAG:
+	case BTF_KIND_VAR:
+	case BTF_KIND_ENUM64:
+		break;
+	case BTF_KIND_STRUCT:
+	case BTF_KIND_UNION: {
+		struct btf_member *m = btf_members(btf_type);
+		__u16 vlen = btf_vlen(btf_type);
+
+		if (behind_ptr)
+			break;
+
+		for (i = 0; i < vlen; i++, m++) {
+			/* mark member */
+			btfgen_mark_member(info, type_id, i);
+
+			/* mark member's type */
+			err = btfgen_mark_type_match(info, m->type, false);
+			if (err)
+				return err;
+		}
+		break;
+	}
+	case BTF_KIND_CONST:
+	case BTF_KIND_FWD:
+	case BTF_KIND_RESTRICT:
+	case BTF_KIND_TYPEDEF:
+	case BTF_KIND_VOLATILE:
+		return btfgen_mark_type_match(info, btf_type->type, behind_ptr);
+	case BTF_KIND_PTR:
+		return btfgen_mark_type_match(info, btf_type->type, true);
+	case BTF_KIND_ARRAY: {
+		struct btf_array *array;
+
+		array = btf_array(btf_type);
+		/* mark array type */
+		err = btfgen_mark_type_match(info, array->type, false);
+		/* mark array's index type */
+		err = err ? : btfgen_mark_type_match(info, array->index_type, false);
+		if (err)
+			return err;
+		break;
+	}
+	case BTF_KIND_FUNC:
 	case BTF_KIND_FUNC_PROTO: {
 		__u16 vlen = btf_vlen(btf_type);
 		struct btf_param *param;
@@ -2275,6 +2377,72 @@ static int minimize_btf(const char *src_btf, const char *dst_btf, const char *ob
 			goto out;
 		}
 	}
+	
+	btf_new = btfgen_get_btf(info);
+	if (!btf_new) {
+		err = -errno;
+		p_err("error generating BTF: %s", strerror(errno));
+		goto out;
+	}
+
+	err = btf_save_raw(btf_new, dst_btf);
+	if (err) {
+		p_err("error saving btf file: %s", strerror(errno));
+		goto out;
+	}
+
+out:
+	btf__free(btf_new);
+	btfgen_free_info(info);
+
+	return err;
+}
+
+static const char *btf_str(const struct btf *btf, __u32 off)
+{
+	if (!off)
+		return "(anon)";
+	return btf__name_by_offset(btf, off) ? : "(invalid)";
+}
+
+/* Strip all other types except the supplied ones of an existing BTF file.
+ */
+static int strip_btf(const char *src_btf, const char *dst_btf, const char *typenames[])
+{
+	struct btfgen_info *info;
+	struct btf *btf_new = NULL;
+	const char *type_name;
+	struct btf_type *t;
+	int start_id = 1;
+	int err, i, cnt, found, name_idx;
+
+	info = btfgen_new_info(src_btf);
+	if (!info) {
+		err = -errno;
+		p_err("failed to allocate info structure: %s", strerror(errno));
+		goto out;
+	}
+	
+	cnt = btf__type_cnt(info->src_btf);
+	for (i = start_id; i < cnt; i++) {
+		found = 1;
+		t = (struct btf_type *) btf__type_by_id(info->src_btf, i);
+		type_name = btf_str(info->src_btf, t->name_off);
+
+		for (name_idx = 0; typenames[name_idx] != NULL && found != 0; name_idx++) {
+			found = strcmp(type_name, typenames[name_idx]);
+		}
+
+		if (found != 0) {
+			continue;
+		}
+		
+		err = btfgen_mark_all_type(info, i, false);
+		if (err) {
+			p_err("error marking BTF: %s", strerror(errno));
+			goto out;
+		}
+	}
 
 	btf_new = btfgen_get_btf(info);
 	if (!btf_new) {
@@ -2324,11 +2492,40 @@ static int do_min_core_btf(int argc, char **argv)
 	return err;
 }
 
+static int do_strip(int argc, char **argv)
+{
+	const char *input, *output, **typenames;
+	int i, err;
+
+	if (!REQ_ARGS(3)) {
+		usage();
+		return -1;
+	}
+
+	input = GET_ARG();
+	output = GET_ARG();
+
+	typenames = (const char **) calloc(argc + 1, sizeof(*typenames));
+	if (!typenames) {
+		p_err("failed to allocate array for object names");
+		return -ENOMEM;
+	}
+
+	i = 0;
+	while (argc)
+		typenames[i++] = GET_ARG();
+
+	err = strip_btf(input, output, typenames);
+	free(typenames);
+	return err;
+}
+
 static const struct cmd cmds[] = {
 	{ "object",		do_object },
 	{ "skeleton",		do_skeleton },
 	{ "subskeleton",	do_subskeleton },
 	{ "min_core_btf",	do_min_core_btf},
+	{ "strip",	do_strip},
 	{ "help",		do_help },
 	{ 0 }
 };
